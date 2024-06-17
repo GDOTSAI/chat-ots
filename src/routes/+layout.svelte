@@ -1,5 +1,10 @@
 <script>
 	import { io } from 'socket.io-client';
+	import { spring } from 'svelte/motion';
+
+	let loadingProgress = spring(0, {
+		stiffness: 0.05
+	});
 
 	import { onMount, tick, setContext } from 'svelte';
 	import {
@@ -13,6 +18,7 @@
 		USAGE_POOL
 	} from '$lib/stores';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/stores';
 	import { Toaster, toast } from 'svelte-sonner';
 
 	import { getBackendConfig } from '$lib/apis';
@@ -106,7 +112,11 @@
 						await goto('/auth');
 					}
 				} else {
-					await goto('/auth');
+					// Don't redirect if we're already on the auth page
+					// Needed because we pass in tokens from OAuth logins via URL fragments
+					if ($page.url.pathname !== '/auth') {
+						await goto('/auth');
+					}
 				}
 			}
 		} else {
@@ -116,8 +126,35 @@
 
 		await tick();
 
-		document.getElementById('splash-screen')?.remove();
-		loaded = true;
+		if (
+			document.documentElement.classList.contains('her') &&
+			document.getElementById('progress-bar')
+		) {
+			loadingProgress.subscribe((value) => {
+				const progressBar = document.getElementById('progress-bar');
+
+				if (progressBar) {
+					progressBar.style.width = `${value}%`;
+				}
+			});
+
+			await loadingProgress.set(100);
+
+			document.getElementById('splash-screen')?.remove();
+
+			const audio = new Audio(`/audio/greeting.mp3`);
+			const playAudio = () => {
+				audio.play();
+				document.removeEventListener('click', playAudio);
+			};
+
+			document.addEventListener('click', playAudio);
+
+			loaded = true;
+		} else {
+			document.getElementById('splash-screen')?.remove();
+			loaded = true;
+		}
 
 		return () => {
 			window.removeEventListener('resize', onResize);

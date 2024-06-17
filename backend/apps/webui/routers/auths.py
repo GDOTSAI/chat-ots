@@ -9,7 +9,6 @@ import re
 import uuid
 import csv
 
-
 from apps.webui.models.auths import (
     SigninForm,
     SignupForm,
@@ -33,7 +32,10 @@ from utils.utils import (
 from utils.misc import parse_duration, validate_email_format
 from utils.webhook import post_webhook
 from constants import ERROR_MESSAGES, WEBHOOK_MESSAGES
-from config import WEBUI_AUTH, WEBUI_AUTH_TRUSTED_EMAIL_HEADER
+from config import (
+    WEBUI_AUTH,
+    WEBUI_AUTH_TRUSTED_EMAIL_HEADER,
+)
 
 router = APIRouter()
 

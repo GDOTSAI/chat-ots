@@ -1,4 +1,8 @@
+import uuid
 from contextlib import asynccontextmanager
+
+from authlib.integrations.starlette_client import OAuth
+from authlib.oidc.core import UserInfo
 from bs4 import BeautifulSoup
 import json
 import markdown
@@ -11,6 +15,7 @@ import requests
 import mimetypes
 import shutil
 import os
+import inspect
 import asyncio
 
 from fastapi import FastAPI, Request, Depends, status, UploadFile, File, Form
@@ -21,7 +26,8 @@ from fastapi.middleware.wsgi import WSGIMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import StreamingResponse, Response
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import StreamingResponse, Response, RedirectResponse
 
 
 from apps.socket.main import app as socket_app
@@ -46,16 +52,29 @@ from apps.webui.main import app as webui_app
 from pydantic import BaseModel
 from typing import List, Optional
 
+from apps.webui.models.auths import Auths
 from apps.webui.models.models import Models, ModelModel
+from apps.webui.models.tools import Tools
+from apps.webui.models.users import Users
+from apps.webui.utils import load_toolkit_module_by_id
+
+from utils.misc import parse_duration
 from utils.utils import (
     get_admin_user,
     get_verified_user,
     get_current_user,
     get_http_authorization_cred,
+    get_password_hash,
+    create_token,
 )
-from utils.task import title_generation_template, search_query_generation_template
+from utils.task import (
+    title_generation_template,
+    search_query_generation_template,
+    tools_function_calling_generation_template,
+)
+from utils.misc import get_last_user_message, add_or_update_system_message
 
-from apps.rag.utils import rag_messages
+from apps.rag.utils import get_rag_context, rag_template
 
 from config import (
     CONFIG_DATA,
@@ -82,9 +101,17 @@ from config import (
     TITLE_GENERATION_PROMPT_TEMPLATE,
     SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
     SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
+    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
+    OAUTH_PROVIDERS,
+    ENABLE_OAUTH_SIGNUP,
+    OAUTH_MERGE_ACCOUNTS_BY_EMAIL,
+    WEBUI_SECRET_KEY,
+    WEBUI_SESSION_COOKIE_SAME_SITE,
+    WEBUI_SESSION_COOKIE_SECURE,
     AppConfig,
 )
-from constants import ERROR_MESSAGES
+from constants import ERROR_MESSAGES, WEBHOOK_MESSAGES
+from utils.webhook import post_webhook
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
@@ -148,24 +175,121 @@ app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE = (
 app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD = (
     SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD
 )
+app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
+    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+)
 
 app.state.MODELS = {}
 
 origins = ["*"]
 
-# Custom middleware to add security headers
-# class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-#     async def dispatch(self, request: Request, call_next):
-#         response: Response = await call_next(request)
-#         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-#         response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
-#         return response
+
+async def get_function_call_response(messages, tool_id, template, task_model_id, user):
+    tool = Tools.get_tool_by_id(tool_id)
+    tools_specs = json.dumps(tool.specs, indent=2)
+    content = tools_function_calling_generation_template(template, tools_specs)
+
+    user_message = get_last_user_message(messages)
+    prompt = (
+        "History:\n"
+        + "\n".join(
+            [
+                f"{message['role'].upper()}: \"\"\"{message['content']}\"\"\""
+                for message in messages[::-1][:4]
+            ]
+        )
+        + f"\nQuery: {user_message}"
+    )
+
+    print(prompt)
+
+    payload = {
+        "model": task_model_id,
+        "messages": [
+            {"role": "system", "content": content},
+            {"role": "user", "content": f"Query: {prompt}"},
+        ],
+        "stream": False,
+    }
+
+    try:
+        payload = filter_pipeline(payload, user)
+    except Exception as e:
+        raise e
+
+    model = app.state.MODELS[task_model_id]
+
+    response = None
+    try:
+        if model["owned_by"] == "ollama":
+            response = await generate_ollama_chat_completion(
+                OpenAIChatCompletionForm(**payload), user=user
+            )
+        else:
+            response = await generate_openai_chat_completion(payload, user=user)
+
+        content = None
+
+        if hasattr(response, "body_iterator"):
+            async for chunk in response.body_iterator:
+                data = json.loads(chunk.decode("utf-8"))
+                content = data["choices"][0]["message"]["content"]
+
+            # Cleanup any remaining background tasks if necessary
+            if response.background is not None:
+                await response.background()
+        else:
+            content = response["choices"][0]["message"]["content"]
+
+        # Parse the function response
+        if content is not None:
+            print(f"content: {content}")
+            result = json.loads(content)
+            print(result)
+
+            # Call the function
+            if "name" in result:
+                if tool_id in webui_app.state.TOOLS:
+                    toolkit_module = webui_app.state.TOOLS[tool_id]
+                else:
+                    toolkit_module = load_toolkit_module_by_id(tool_id)
+                    webui_app.state.TOOLS[tool_id] = toolkit_module
+
+                function = getattr(toolkit_module, result["name"])
+                function_result = None
+                try:
+                    # Get the signature of the function
+                    sig = inspect.signature(function)
+                    # Check if '__user__' is a parameter of the function
+                    if "__user__" in sig.parameters:
+                        # Call the function with the '__user__' parameter included
+                        function_result = function(
+                            **{
+                                **result["parameters"],
+                                "__user__": {
+                                    "id": user.id,
+                                    "email": user.email,
+                                    "name": user.name,
+                                    "role": user.role,
+                                },
+                            }
+                        )
+                    else:
+                        # Call the function without modifying the parameters
+                        function_result = function(**result["parameters"])
+                except Exception as e:
+                    print(e)
+
+                # Add the function result to the system prompt
+                if function_result:
+                    return function_result
+    except Exception as e:
+        print(f"Error: {e}")
+
+    return None
 
 
-# app.add_middleware(SecurityHeadersMiddleware)
-
-
-class RAGMiddleware(BaseHTTPMiddleware):
+class ChatCompletionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         return_citations = False
 
@@ -182,35 +306,98 @@ class RAGMiddleware(BaseHTTPMiddleware):
             # Parse string to JSON
             data = json.loads(body_str) if body_str else {}
 
+            user = get_current_user(
+                get_http_authorization_cred(request.headers.get("Authorization"))
+            )
+
+            # Remove the citations from the body
             return_citations = data.get("citations", False)
             if "citations" in data:
                 del data["citations"]
 
-            # Example: Add a new key-value pair or modify existing ones
-            # data["modified"] = True  # Example modification
+            # Set the task model
+            task_model_id = data["model"]
+            if task_model_id not in app.state.MODELS:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Model not found",
+                )
+
+            # Check if the user has a custom task model
+            # If the user has a custom task model, use that model
+            if app.state.MODELS[task_model_id]["owned_by"] == "ollama":
+                if (
+                    app.state.config.TASK_MODEL
+                    and app.state.config.TASK_MODEL in app.state.MODELS
+                ):
+                    task_model_id = app.state.config.TASK_MODEL
+            else:
+                if (
+                    app.state.config.TASK_MODEL_EXTERNAL
+                    and app.state.config.TASK_MODEL_EXTERNAL in app.state.MODELS
+                ):
+                    task_model_id = app.state.config.TASK_MODEL_EXTERNAL
+
+            prompt = get_last_user_message(data["messages"])
+            context = ""
+
+            # If tool_ids field is present, call the functions
+            if "tool_ids" in data:
+                print(data["tool_ids"])
+                for tool_id in data["tool_ids"]:
+                    print(tool_id)
+                    try:
+                        response = await get_function_call_response(
+                            messages=data["messages"],
+                            tool_id=tool_id,
+                            template=app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
+                            task_model_id=task_model_id,
+                            user=user,
+                        )
+
+                        if response:
+                            context += ("\n" if context != "" else "") + response
+                    except Exception as e:
+                        print(f"Error: {e}")
+                del data["tool_ids"]
+
+                print(f"tool_context: {context}")
+
+            # If docs field is present, generate RAG completions
             if "docs" in data:
                 data = {**data}
-                data["messages"], citations = rag_messages(
+                rag_context, citations = get_rag_context(
                     docs=data["docs"],
                     messages=data["messages"],
-                    template=rag_app.state.config.RAG_TEMPLATE,
                     embedding_function=rag_app.state.EMBEDDING_FUNCTION,
                     k=rag_app.state.config.TOP_K,
                     reranking_function=rag_app.state.sentence_transformer_rf,
                     r=rag_app.state.config.RELEVANCE_THRESHOLD,
                     hybrid_search=rag_app.state.config.ENABLE_RAG_HYBRID_SEARCH,
                 )
+
+                if rag_context:
+                    context += ("\n" if context != "" else "") + rag_context
+
                 del data["docs"]
 
-                log.debug(
-                    f"data['messages']: {data['messages']}, citations: {citations}"
+                log.debug(f"rag_context: {rag_context}, citations: {citations}")
+
+            if context != "":
+                system_prompt = rag_template(
+                    rag_app.state.config.RAG_TEMPLATE, context, prompt
+                )
+
+                print(system_prompt)
+
+                data["messages"] = add_or_update_system_message(
+                    f"\n{system_prompt}", data["messages"]
                 )
 
             modified_body_bytes = json.dumps(data).encode("utf-8")
 
             # Replace the request body with the modified one
             request._body = modified_body_bytes
-
             # Set custom header to ensure content-length matches new body length
             request.headers.__dict__["_list"] = [
                 (b"content-length", str(len(modified_body_bytes)).encode("utf-8")),
@@ -253,7 +440,7 @@ class RAGMiddleware(BaseHTTPMiddleware):
             yield data
 
 
-app.add_middleware(RAGMiddleware)
+app.add_middleware(ChatCompletionMiddleware)
 
 
 def filter_pipeline(payload, user):
@@ -308,13 +495,10 @@ def filter_pipeline(payload, user):
             if r is not None:
                 try:
                     res = r.json()
-                    if "detail" in res:
-                        return JSONResponse(
-                            status_code=r.status_code,
-                            content=res,
-                        )
                 except:
                     pass
+                if "detail" in res:
+                    raise Exception(r.status_code, res["detail"])
 
             else:
                 pass
@@ -325,6 +509,10 @@ def filter_pipeline(payload, user):
 
         if "title" in payload:
             del payload["title"]
+
+        if "task" in payload:
+            del payload["task"]
+
     return payload
 
 
@@ -346,7 +534,14 @@ class PipelineMiddleware(BaseHTTPMiddleware):
             user = get_current_user(
                 get_http_authorization_cred(request.headers.get("Authorization"))
             )
-            data = filter_pipeline(data, user)
+
+            try:
+                data = filter_pipeline(data, user)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=e.args[0],
+                    content={"detail": e.args[1]},
+                )
 
             modified_body_bytes = json.dumps(data).encode("utf-8")
             # Replace the request body with the modified one
@@ -515,6 +710,7 @@ async def get_task_config(user=Depends(get_verified_user)):
         "TITLE_GENERATION_PROMPT_TEMPLATE": app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE,
         "SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE": app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
         "SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD": app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
+        "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE": app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
     }
 
 
@@ -524,6 +720,7 @@ class TaskConfigForm(BaseModel):
     TITLE_GENERATION_PROMPT_TEMPLATE: str
     SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE: str
     SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD: int
+    TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE: str
 
 
 @app.post("/api/task/config/update")
@@ -539,6 +736,9 @@ async def update_task_config(form_data: TaskConfigForm, user=Depends(get_admin_u
     app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD = (
         form_data.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD
     )
+    app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE = (
+        form_data.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+    )
 
     return {
         "TASK_MODEL": app.state.config.TASK_MODEL,
@@ -546,6 +746,7 @@ async def update_task_config(form_data: TaskConfigForm, user=Depends(get_admin_u
         "TITLE_GENERATION_PROMPT_TEMPLATE": app.state.config.TITLE_GENERATION_PROMPT_TEMPLATE,
         "SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE": app.state.config.SEARCH_QUERY_GENERATION_PROMPT_TEMPLATE,
         "SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD": app.state.config.SEARCH_QUERY_PROMPT_LENGTH_THRESHOLD,
+        "TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE": app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
     }
 
 
@@ -592,7 +793,14 @@ async def generate_title(form_data: dict, user=Depends(get_verified_user)):
     }
 
     print(payload)
-    payload = filter_pipeline(payload, user)
+
+    try:
+        payload = filter_pipeline(payload, user)
+    except Exception as e:
+        return JSONResponse(
+            status_code=e.args[0],
+            content={"detail": e.args[1]},
+        )
 
     if model["owned_by"] == "ollama":
         return await generate_ollama_chat_completion(
@@ -646,10 +854,18 @@ async def generate_search_query(form_data: dict, user=Depends(get_verified_user)
         "messages": [{"role": "user", "content": content}],
         "stream": False,
         "max_tokens": 30,
+        "task": True,
     }
 
     print(payload)
-    payload = filter_pipeline(payload, user)
+
+    try:
+        payload = filter_pipeline(payload, user)
+    except Exception as e:
+        return JSONResponse(
+            status_code=e.args[0],
+            content={"detail": e.args[1]},
+        )
 
     if model["owned_by"] == "ollama":
         return await generate_ollama_chat_completion(
@@ -657,6 +873,109 @@ async def generate_search_query(form_data: dict, user=Depends(get_verified_user)
         )
     else:
         return await generate_openai_chat_completion(payload, user=user)
+
+
+@app.post("/api/task/emoji/completions")
+async def generate_emoji(form_data: dict, user=Depends(get_verified_user)):
+    print("generate_emoji")
+
+    model_id = form_data["model"]
+    if model_id not in app.state.MODELS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found",
+        )
+
+    # Check if the user has a custom task model
+    # If the user has a custom task model, use that model
+    if app.state.MODELS[model_id]["owned_by"] == "ollama":
+        if app.state.config.TASK_MODEL:
+            task_model_id = app.state.config.TASK_MODEL
+            if task_model_id in app.state.MODELS:
+                model_id = task_model_id
+    else:
+        if app.state.config.TASK_MODEL_EXTERNAL:
+            task_model_id = app.state.config.TASK_MODEL_EXTERNAL
+            if task_model_id in app.state.MODELS:
+                model_id = task_model_id
+
+    print(model_id)
+    model = app.state.MODELS[model_id]
+
+    template = '''
+Your task is to reflect the speaker's likely facial expression through a fitting emoji. Interpret emotions from the message and reflect their facial expression using fitting, diverse emojis (e.g., 😊, 😢, 😡, 😱).
+
+Message: """{{prompt}}"""
+'''
+
+    content = title_generation_template(
+        template, form_data["prompt"], user.model_dump()
+    )
+
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": content}],
+        "stream": False,
+        "max_tokens": 4,
+        "chat_id": form_data.get("chat_id", None),
+        "task": True,
+    }
+
+    print(payload)
+
+    try:
+        payload = filter_pipeline(payload, user)
+    except Exception as e:
+        return JSONResponse(
+            status_code=e.args[0],
+            content={"detail": e.args[1]},
+        )
+
+    if model["owned_by"] == "ollama":
+        return await generate_ollama_chat_completion(
+            OpenAIChatCompletionForm(**payload), user=user
+        )
+    else:
+        return await generate_openai_chat_completion(payload, user=user)
+
+
+@app.post("/api/task/tools/completions")
+async def get_tools_function_calling(form_data: dict, user=Depends(get_verified_user)):
+    print("get_tools_function_calling")
+
+    model_id = form_data["model"]
+    if model_id not in app.state.MODELS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found",
+        )
+
+    # Check if the user has a custom task model
+    # If the user has a custom task model, use that model
+    if app.state.MODELS[model_id]["owned_by"] == "ollama":
+        if app.state.config.TASK_MODEL:
+            task_model_id = app.state.config.TASK_MODEL
+            if task_model_id in app.state.MODELS:
+                model_id = task_model_id
+    else:
+        if app.state.config.TASK_MODEL_EXTERNAL:
+            task_model_id = app.state.config.TASK_MODEL_EXTERNAL
+            if task_model_id in app.state.MODELS:
+                model_id = task_model_id
+
+    print(model_id)
+    template = app.state.config.TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE
+
+    try:
+        context = await get_function_call_response(
+            form_data["messages"], form_data["tool_id"], template, model_id, user
+        )
+        return context
+    except Exception as e:
+        return JSONResponse(
+            status_code=e.args[0],
+            content={"detail": e.args[1]},
+        )
 
 
 @app.post("/api/chat/completions")
@@ -1103,6 +1422,12 @@ async def get_app_config():
                 "engine": audio_app.state.config.STT_ENGINE,
             },
         },
+        "oauth": {
+            "providers": {
+                name: config.get("name", name)
+                for name, config in OAUTH_PROVIDERS.items()
+            }
+        },
     }
 
 
@@ -1179,6 +1504,111 @@ async def get_app_latest_release_version():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
         )
+
+
+############################
+# OAuth Login & Callback
+############################
+
+oauth = OAuth()
+
+for provider_name, provider_config in OAUTH_PROVIDERS.items():
+    oauth.register(
+        name=provider_name,
+        client_id=provider_config["client_id"],
+        client_secret=provider_config["client_secret"],
+        server_metadata_url=provider_config["server_metadata_url"],
+        client_kwargs={
+            "scope": provider_config["scope"],
+        },
+    )
+
+# SessionMiddleware is used by authlib for oauth
+if len(OAUTH_PROVIDERS) > 0:
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=WEBUI_SECRET_KEY,
+        session_cookie="oui-session",
+        same_site=WEBUI_SESSION_COOKIE_SAME_SITE,
+        https_only=WEBUI_SESSION_COOKIE_SECURE,
+    )
+
+
+@app.get("/oauth/{provider}/login")
+async def oauth_login(provider: str, request: Request):
+    if provider not in OAUTH_PROVIDERS:
+        raise HTTPException(404)
+    redirect_uri = request.url_for("oauth_callback", provider=provider)
+    return await oauth.create_client(provider).authorize_redirect(request, redirect_uri)
+
+
+@app.get("/oauth/{provider}/callback")
+async def oauth_callback(provider: str, request: Request):
+    if provider not in OAUTH_PROVIDERS:
+        raise HTTPException(404)
+    client = oauth.create_client(provider)
+    try:
+        token = await client.authorize_access_token(request)
+    except Exception as e:
+        log.error(f"OAuth callback error: {e}")
+        raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+    user_data: UserInfo = token["userinfo"]
+
+    sub = user_data.get("sub")
+    if not sub:
+        raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+    provider_sub = f"{provider}@{sub}"
+
+    # Check if the user exists
+    user = Users.get_user_by_oauth_sub(provider_sub)
+
+    if not user:
+        # If the user does not exist, check if merging is enabled
+        if OAUTH_MERGE_ACCOUNTS_BY_EMAIL.value:
+            # Check if the user exists by email
+            email = user_data.get("email", "").lower()
+            if not email:
+                raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+            user = Users.get_user_by_email(user_data.get("email", "").lower(), True)
+            if user:
+                # Update the user with the new oauth sub
+                Users.update_user_oauth_sub_by_id(user.id, provider_sub)
+
+    if not user:
+        # If the user does not exist, check if signups are enabled
+        if ENABLE_OAUTH_SIGNUP.value:
+            user = Auths.insert_new_auth(
+                email=user_data.get("email", "").lower(),
+                password=get_password_hash(
+                    str(uuid.uuid4())
+                ),  # Random password, not used
+                name=user_data.get("name", "User"),
+                profile_image_url=user_data.get("picture", "/user.png"),
+                role=webui_app.state.config.DEFAULT_USER_ROLE,
+                oauth_sub=provider_sub,
+            )
+
+            if webui_app.state.config.WEBHOOK_URL:
+                post_webhook(
+                    webui_app.state.config.WEBHOOK_URL,
+                    WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                    {
+                        "action": "signup",
+                        "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                        "user": user.model_dump_json(exclude_none=True),
+                    },
+                )
+        else:
+            raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
+
+    jwt_token = create_token(
+        data={"id": user.id},
+        expires_delta=parse_duration(webui_app.state.config.JWT_EXPIRES_IN),
+    )
+
+    # Redirect back to the frontend with the JWT token
+    redirect_url = f"{request.base_url}auth#token={jwt_token}"
+    return RedirectResponse(url=redirect_url)
 
 
 @app.get("/manifest.json")
